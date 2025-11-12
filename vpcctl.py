@@ -1,318 +1,406 @@
 #!/usr/bin/env python3
-from datetime import datetime
-import re
-import subprocess
+"""
+vpcctl.py - Lightweight VPC emulator on a single Linux host using network namespaces,
+veth pairs, linux bridge, iptables, and routing.
+
+Usage examples:
+  sudo ./vpcctl.py create-vpc --name vpc1 --cidr 10.10.0.0/16
+  sudo ./vpcctl.py add-subnet --vpc vpc1 --name public --cidr 10.10.1.0/24 --gateway 10.10.1.1 --public
+  sudo ./vpcctl.py add-subnet --vpc vpc1 --name private --cidr 10.10.2.0/24 --gateway 10.10.2.1
+  sudo ./vpcctl.py deploy-web --vpc vpc1 --subnet public --host-ip 10.10.1.10
+  sudo ./vpcctl.py test --vpc vpc1
+  sudo ./vpcctl.py peer --vpc-a vpc1 --vpc-b vpc2
+  sudo ./vpcctl.py delete-vpc --name vpc1
+"""
+
 import argparse
-import sys
-import ipaddress
+import subprocess
 import json
 import os
 import sys
+import time
+from shlex import quote
 
-CONFIG_FILE = "/tmp/vpcctl_config.json"
-
-def run(cmd):
-    """Run a shell command safely"""
-    print(f"> {cmd}")
-    # subprocess.run(cmd, shell=True, check=True)
-    subprocess.run(cmd.split(), check=True)
-
-def load_config():
-    """Load JSON config from /tmp, or create a new one."""
-    if not os.path.exists(CONFIG_FILE):
-        return {"networks": {}, "namespaces": {}, "peering": {}, "acls": {} }
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_config(cfg):
-    """Save the JSON config to /tmp."""
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=4)
-
-# ---------- CREATE COMMANDS ----------
-def create_bridge(name, ip=None):
-    cfg = load_config()
-    if name in cfg["networks"]:
-        print(f"⚠️ Bridge with {name} already exists in config.")
-        return
-    if ip:
-        run(f"ip link add name {name} type bridge")
-        run(f"ip addr add {ip} dev {name}")
-        run(f"ip link set {name} up")
-        run(f"echo 1 > /proc/sys/net/ipv4/conf/{name}/forwarding")
-
-        cfg["networks"][name] = {
-            "cidr": ip,
-            "created_at": datetime.now().isoformat()
-            }
-        save_config(cfg)
-        print(f"✅ Bridge {name} created with IP {ip}.")
+# ---------- Helpers ----------
+def run(cmd, check=True, capture=False):
+    print(f"+ {cmd}")
+    if capture:
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0 and check:
+            print(res.stdout, res.stderr, file=sys.stderr)
+            raise SystemExit(f"Command failed: {cmd}")
+        return res.stdout.strip()
     else:
-        run(f"ip link add name {name} type bridge")
-        cfg["networks"][name] = {"cidr": ""}
-        save_config(cfg)
-        print(f"✅ Bridge {name} created without IP.")
-    
+        res = subprocess.run(cmd, shell=True)
+        if res.returncode != 0 and check:
+            raise SystemExit(f"Command failed: {cmd}")
 
+def exists_ns(ns):
+    out = run("ip netns list", capture=True)
+    return ns in out.splitlines()
 
-def check_subnet(subnet_cidr,vpc_cidr):
+def ensure_sysctl(key, val="1"):
+    run(f"sysctl -w {key}={val}")
+
+# ---------- Naming helpers ----------
+def br_name(vpc):
+    return f"br-{vpc}"
+
+def ns_name(vpc, subnet):
+    return f"{vpc}-{subnet}"
+
+def veth_host_name(vpc, subnet):
+    return f"veth-{vpc}-{subnet}-h"
+
+def veth_ns_name(vpc, subnet):
+    return f"veth-{vpc}-{subnet}-ns"
+
+def gw_ip(gateway):
+    return gateway  # provided
+
+# ---------- Core functions ----------
+def create_bridge(vpc):
+    br = br_name(vpc)
+    out = run("ip link show type bridge", capture=True)
+    if br in out:
+        print(f"Bridge {br} already exists (idempotent).")
+        return
+    run(f"ip link add name {br} type bridge")
+    run(f"ip link set dev {br} up")
+    print(f"Bridge {br} created and up.")
+
+def delete_bridge(vpc):
+    br = br_name(vpc)
+    # remove any ip assigned
+    run(f"ip link set {br} down", check=False)
+    run(f"ip link del {br}", check=False)
+    print(f"Deleted bridge {br} (if existed).")
+
+def create_namespace(vpc, subnet, gateway_cidr):
+    ns = ns_name(vpc, subnet)
+    if exists_ns(ns):
+        print(f"Namespace {ns} already exists (idempotent).")
+        return
+    run(f"ip netns add {ns}")
+    run(f"ip netns exec {ns} ip link set lo up")
+    print(f"Namespace {ns} created, loopback up.")
+
+def delete_namespace(vpc, subnet):
+    ns = ns_name(vpc, subnet)
+    run(f"ip netns del {ns}", check=False)
+    print(f"Deleted namespace {ns} (if existed).")
+
+def connect_veth_to_bridge(vpc, subnet, ns_ip_cidr, br_iface=None):
+    ns = ns_name(vpc, subnet)
+    host_if = veth_host_name(vpc, subnet)
+    ns_if = veth_ns_name(vpc, subnet)
+    br = br_name(vpc)
+    # idempotent: delete if exists
+    run(f"ip link del {host_if}", check=False)
+    # create veth pair
+    run(f"ip link add {host_if} type veth peer name {ns_if}")
+    # attach host side to bridge
+    run(f"ip link set {host_if} master {br}")
+    run(f"ip link set {host_if} up")
+    # move ns side to namespace
+    run(f"ip link set {ns_if} netns {ns}")
+    # configure addresses
+    run(f"ip netns exec {ns} ip link set {ns_if} up")
+    run(f"ip netns exec {ns} ip addr add {ns_ip_cidr} dev {ns_if}")
+    print(f"Connected {ns_if} -> {br} with {ns_ip_cidr}")
+
+def add_route_for_namespace(vpc, subnet, gw):
+    ns = ns_name(vpc, subnet)
+    run(f"ip netns exec {ns} ip route add default via {gw}", check=False)
+    print(f"Added default route in {ns} via {gw}")
+
+def enable_ip_forwarding():
+    ensure_sysctl("net.ipv4.ip_forward", "1")
+    print("IP forwarding enabled on host.")
+
+def setup_nat_for_bridge(vpc, host_iface_external):
+    br = br_name(vpc)
+    # NAT all outbound from bridge subnet(s) via external interface
+    # Use MASQUERADE - idempotency handled by checking existing rule
+    # We'll add a rule matching the bridge's address range, but simpler: match outgoing on external interface
+    # Delete any existing generic masquerade rule for this external interface to avoid duplicates
+    # Note: To be conservative, allow multiple VPCs: create a chain per-VPC
+    chain = f"VPC_{vpc}_NAT"
+    run(f"iptables -t nat -N {chain}", check=False)
+    run(f"iptables -t nat -F {chain}", check=False)
+    run(f"iptables -t nat -A {chain} -o {host_iface_external} -j MASQUERADE")
+    # ensure POSTROUTING jumps to chain
+    # remove previous jump if exists (crudely)
+    run(f"iptables -t nat -C POSTROUTING -j {chain}", check=False)
     try:
-        subnet = ipaddress.ip_network(subnet_cidr,strict=False)
-        vnet = ipaddress.ip_network(vpc_cidr,strict=False)
+        run(f"iptables -t nat -A POSTROUTING -j {chain}", check=False)
+    except SystemExit:
+        # likely duplicate, ignore
+        pass
+    print(f"NAT (MASQUERADE) set up for VPC {vpc} via {host_iface_external}.")
 
-        return subnet.subnet_of(vnet)
-    except ValueError as e:
-        print(f"❌ Invalid CIDR notation: {e}")
-        return False
-    
-def get_network_addr(ip_cidr):
-    try:
-        network = ipaddress.ip_network(ip_cidr,strict=False)
-        network_ip = str(network.network_address)
-        cidr_prefix = str(network.prefixlen)
+def remove_nat_for_vpc(vpc, host_iface_external):
+    chain = f"VPC_{vpc}_NAT"
+    run(f"iptables -t nat -D POSTROUTING -j {chain}", check=False)
+    run(f"iptables -t nat -F {chain}", check=False)
+    run(f"iptables -t nat -X {chain}", check=False)
+    print(f"Removed NAT chain {chain} for VPC {vpc} (if present).")
 
-        return f"{network_ip}/{cidr_prefix}"
-    except ValueError as e:
-        print(f"Error: Invalid IP/CIDR format. {e}")
-        return None
+# ---------- High-level flows ----------
+def create_vpc(args):
+    vpc = args.name
+    cidr = args.cidr
+    print(f"Creating VPC {vpc} with CIDR {cidr}")
+    create_bridge(vpc)
+    enable_ip_forwarding()
+    print(f"VPC {vpc} created. Add subnets with add-subnet.")
 
-def create_namespace(name, ip=None, bridge=None):
-    cfg = load_config()
+def add_subnet(args):
+    vpc = args.vpc
+    subnet = args.name
+    cidr = args.cidr
+    gateway = args.gateway
+    public = args.public
+    if not exists_ns(ns_name(vpc, subnet)):
+        create_namespace(vpc, subnet, gateway)
+    create_bridge(vpc)
+    # assign gateway to bridge if not already set
+    br = br_name(vpc)
+    # assign bridge IP for gateway (idempotent check)
+    # We'll give the bridge the gateway IP (e.g., 10.10.1.1/24) so it is the router
+    existing = run(f"ip -4 addr show dev {br}", capture=True)
+    if gateway not in existing:
+        run(f"ip addr add {gateway} dev {br}", check=False)
+    run(f"ip link set {br} up", check=False)
+    # connect veth and set namespace IP (we accept full host IP like 10.10.1.10/24)
+    # For the namespace we expect an IP (args.host_ip) optionally; otherwise we'll use first available host IP (.10)
+    ns_ip = args.host_ip if args.host_ip else None
+    # decide namespace-side IP: if user passed host_ip use that; else derive .10
+    if not ns_ip:
+        # derive from gateway: replace last octet with 10
+        parts = gateway.split(".")
+        ns_ip = ".".join(parts[:3] + ["10"]) + "/" + cidr.split("/")[1]
+    connect_veth_to_bridge(vpc, subnet, ns_ip)
+    # add default route in namespace via gateway
+    add_route_for_namespace(vpc, subnet, gateway.split("/")[0])
+    # optionally setup NAT if public
+    if public:
+        if not args.external_iface:
+            raise SystemExit("Public subnet requires --external-iface (host's internet interface) to enable NAT.")
+        setup_nat_for_bridge(vpc, args.external_iface)
+    print(f"Subnet {subnet} added to VPC {vpc}. public={public}")
 
-    if name in cfg["namespaces"]:
-        print(f"⚠️ Namespace {name} already exists in config.")
-        return
+def delete_vpc(args):
+    vpc = args.name
+    print(f"Deleting VPC {vpc} and cleaning up resources.")
+    # list namespaces whose name startswith vpc-
+    out = run("ip netns list", capture=True)
+    lines = out.splitlines()
+    for l in lines:
+        if l.startswith(vpc + "-"):
+            ns = l.split()[0]
+            print(f"Deleting namespace {ns}")
+            run(f"ip netns del {ns}", check=False)
+    # delete veths left on host that match prefix
+    # delete bridge
+    # remove iptables NAT chain
+    # attempt to delete veth links (pattern)
+    run(f"ip -o link show | awk -F': ' '{{print $2}}' | grep '^veth-{vpc}-' | xargs -r -n1 ip link del", check=False)
+    remove_nat_for_vpc(vpc, args.external_iface if args.external_iface else "eth0")
+    delete_bridge(vpc)
+    print("Cleanup done. Verify with `ip netns list` and `ip link show`.")
 
-    if bridge not in cfg["networks"]:
-        print(f"❌ Bridge {bridge} not found in config. Create it first.")
-        sys.exit(1)
-    
-    bridge_cidr = cfg["networks"][bridge]["cidr"]
-    if ip and bridge_cidr:
-        if not check_subnet(ip, bridge_cidr):
-            print(f"❌ IP {ip} is not in the subnet of bridge {bridge} ({bridge_cidr}).")
-            sys.exit(1)
-    
+def list_vpcs(args):
+    out = run("ip -o link show type bridge", capture=True)
+    lines = out.splitlines()
+    print("Bridges (possible VPCs):")
+    for l in lines:
+        print("  " + l)
 
-    if ip and bridge:
-        # Auto-create veth and assign IP
-        veth_ns = f"{name}_ns"
-        veth_host = f"{name}_br"
-        run(f"ip netns add {name}")
-        run(f"ip link add {veth_ns} type veth peer name {veth_host}")
-        # run(f"ip link set {veth_ns} netns {name}")
-        run(f"ip link set {veth_host} master {bridge}")
-        run(f"ip link set {veth_host} up")
+# ---------- Security group / iptables from JSON ----------
+def apply_policy(args):
+    """
+    policy JSON example:
+    {
+      "subnet": "10.10.1.0/24",
+      "ingress": [
+        {"port": 80, "protocol": "tcp", "action": "allow"},
+        {"port": 22, "protocol": "tcp", "action": "deny"}
+      ]
+    }
+    We will translate to iptables rules executed inside the namespace for that subnet.
+    """
+    policy_file = args.file
+    with open(policy_file) as f:
+        policies = json.load(f)
+    # policies can be list or single
+    if isinstance(policies, dict):
+        policies = [policies]
+    for p in policies:
+        subnet = p["subnet"]
+        # find namespace(s) that match this subnet -- naive: search namespaces and their IPs
+        ns_list = run("ip netns list", capture=True).splitlines()
+        for ns in ns_list:
+            ns_name_only = ns.split()[0]
+            ips = run(f"ip netns exec {ns_name_only} ip -4 addr show", capture=True)
+            if subnet.split("/")[0] in ips:
+                # apply rules inside ns
+                print(f"Applying policy to namespace {ns_name_only}")
+                # flush existing filter rules in custom chain
+                chain = f"SG_{ns_name_only}"
+                run(f"ip netns exec {ns_name_only} iptables -N {chain}", check=False)
+                run(f"ip netns exec {ns_name_only} iptables -F {chain}", check=False)
+                # default deny (if ingress defined) - but we will just add specific allow/deny entries on INPUT
+                for rule in p.get("ingress", []):
+                    port = rule["port"]
+                    proto = rule.get("protocol", "tcp")
+                    action = rule.get("action", "allow")
+                    if action == "allow":
+                        run(f"ip netns exec {ns_name_only} iptables -A INPUT -p {proto} --dport {port} -j ACCEPT")
+                    elif action == "deny":
+                        run(f"ip netns exec {ns_name_only} iptables -A INPUT -p {proto} --dport {port} -j REJECT")
+                # allow established
+                run(f"ip netns exec {ns_name_only} iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT")
+                # drop by default (optional)
+                run(f"ip netns exec {ns_name_only} iptables -A INPUT -j DROP")
+                print(f"Policies applied in {ns_name_only}.")
+    print("Policy application complete.")
 
-        run(f"ip link set {veth_ns} netns {name}")
-        run(f"ip netns exec {name} ip link set lo up")
-        run(f"ip netns exec {name} ip link set {veth_ns} up")
-        run(f"ip netns exec {name} ip addr add {ip} dev {veth_ns}") 
-        
-        run(f"ip netns exec {name} ip route add default via {bridge_cidr.split('/')[0]} dev {veth_ns} onlink")
+# ---------- Peering ----------
+def peer_vpcs(args):
+    a = args.vpc_a
+    b = args.vpc_b
+    # create veth pair host side names
+    veth_a = f"peer-{a}-{b}-a"
+    veth_b = f"peer-{a}-{b}-b"
+    # create pair
+    run(f"ip link add {veth_a} type veth peer name {veth_b}", check=False)
+    # attach each to bridges
+    run(f"ip link set {veth_a} master {br_name(a)}", check=False)
+    run(f"ip link set {veth_b} master {br_name(b)}", check=False)
+    run(f"ip link set {veth_a} up", check=False)
+    run(f"ip link set {veth_b} up", check=False)
+    # Add static routes on host: to be explicit, user may add routes inside namespaces if desired
+    print(f"Peering created between {a} and {b} via {veth_a}<->{veth_b}. Add routes inside namespaces as needed.")
+    # Note: to restrict peering to specific CIDRs you'd add iptables rules on bridges or in namespaces
 
+# ---------- Deploy simple web server inside a namespace ----------
+def deploy_web(args):
+    vpc = args.vpc
+    subnet = args.subnet
+    host_ip = args.host_ip
+    ns = ns_name(vpc, subnet)
+    if not exists_ns(ns):
+        raise SystemExit(f"Namespace {ns} not found. Create subnet first.")
+    # install or rely on python3 -m http.server
+    # launch server with nohup inside namespace on port 80 (requires root inside ns)
+    logfile = f"/tmp/{ns}-web.log"
+    # kill existing server on port 80 (if any) inside namespace
+    run(f"ip netns exec {ns} bash -c \"fuser -k 80/tcp || true\"", check=False)
+    cmd = f"ip netns exec {ns} nohup python3 -m http.server 80 >/tmp/{ns}-web.log 2>&1 &"
+    run(cmd)
+    print(f"Deployed python http.server in {ns} on 0.0.0.0:80 (namespace internal). Log: {logfile}")
 
-        cfg["namespaces"][name] = {
-            "network_cidr": get_network_addr(ip),
-            "ns_ip": ip,
-            "bridge": bridge,
-            "veth_ns": veth_ns,
-            "veth_host": veth_host,
-            "public": False,
-            "created_at": datetime.now().isoformat()
-        }
-        save_config(cfg)
+# ---------- Testing helpers ----------
+def tests(args):
+    vpc = args.vpc
+    # basic tests: list namespaces, ping between subnets, curl from host to public webserver
+    br = br_name(vpc)
+    print("Namespaces:")
+    print(run("ip netns list", capture=True))
+    # find subnets for this vpc
+    out = run("ip netns list", capture=True)
+    ns_names = [l.split()[0] for l in out.splitlines() if l.startswith(vpc + "-")]
+    print("Namespaces for VPC:", ns_names)
+    for ns in ns_names:
+        print(f"-- IPs in {ns}:")
+        print(run(f"ip netns exec {ns} ip -4 addr show", capture=True))
+    # ping test: pick first two ns and ping
+    if len(ns_names) >= 2:
+        a = ns_names[0]; b = ns_names[1]
+        # get IP of b
+        outb = run(f"ip netns exec {b} ip -4 addr show | awk '/inet /{{print $2}}' | head -n1", capture=True)
+        if outb:
+            ipb = outb.split("/")[0]
+            print(f"Pinging from {a} -> {ipb}")
+            run(f"ip netns exec {a} ping -c 3 {ipb}")
+    print("Tests completed. For NAT test, try curl from namespace to external IP (e.g., 8.8.8.8)")
 
-        print(f"✅ Veth {veth_ns} <-> {veth_host} created and IP {ip} assigned.")
-    else:
-        run(f"ip netns add {name}")
-        cfg["namespaces"][name] = {
-            "ip": "",
-            "bridge": ""
-        }
-        save_config(cfg)
-        print(f"⚠️  Namespace {name} created Without IP. No IP or bridge provided")
+# ---------- CLI argument parser ----------
+def build_parser():
+    p = argparse.ArgumentParser(prog="vpcctl", description="Mini VPC on Linux using namespaces and bridges.")
+    sub = p.add_subparsers(dest="cmd")
 
-def create_veth(name_ns, name_host, namespace, bridge):
-    run(f"ip link add {name_ns} type veth peer name {name_host}")
-    run(f"ip link set {name_ns} netns {namespace}")
-    run(f"ip link set {name_host} master {bridge}")
-    run(f"ip link set {name_host} up")
-    run(f"ip netns exec {namespace} ip link set {name_ns} up")
-    print(f"✅ Veth {name_ns} <-> {name_host} created and attached to {namespace} & {bridge}.")
+    # create-vpc
+    c = sub.add_parser("create-vpc")
+    c.add_argument("--name", required=True)
+    c.add_argument("--cidr", required=True)
 
+    # add-subnet
+    s = sub.add_parser("add-subnet")
+    s.add_argument("--vpc", required=True)
+    s.add_argument("--name", required=True)
+    s.add_argument("--cidr", required=True, help="e.g. 10.10.1.0/24")
+    s.add_argument("--gateway", required=True, help="gateway ip for bridge e.g. 10.10.1.1/24")
+    s.add_argument("--public", action="store_true", help="mark subnet as public (enables NAT)")
+    s.add_argument("--external-iface", help="host's external interface (required for public nat)")
+    s.add_argument("--host-ip", help="ip to assign to namespace veth (e.g. 10.10.1.10/24)")
 
+    # delete-vpc
+    d = sub.add_parser("delete-vpc")
+    d.add_argument("--name", required=True)
+    d.add_argument("--external-iface", help="host external interface (for NAT cleanup)")
 
-# ---------- SET COMMANDS ----------
-def set_ip(namespace, interface, ip):
-    run(f"ip netns exec {namespace} ip addr add {ip} dev {interface}")
-    run(f"ip netns exec {namespace} ip link set {interface} up")
-    print(f"✅ IP {ip} assigned to {interface} in {namespace}.")
+    # list-vpcs
+    sub.add_parser("list-vpcs")
 
-# def set_route(namespace, destination, via):
-#     run(f"ip netns exec {namespace} ip route add {destination} via {via}")
-#     print(f"✅ Route {destination} via {via} set in {namespace}.")
+    # apply policy
+    ap = sub.add_parser("apply-policy")
+    ap.add_argument("--file", required=True)
 
-def set_route(ns1, ns2, bridge):
-    cfg = load_config()
-    if bridge not in cfg["networks"]:
-        print(f"⚠️ Bridge with {bridge} does not exist in config.")
-        return
+    # peer
+    pr = sub.add_parser("peer")
+    pr.add_argument("--vpc-a", required=True)
+    pr.add_argument("--vpc-b", required=True)
 
+    # deploy web
+    dw = sub.add_parser("deploy-web")
+    dw.add_argument("--vpc", required=True)
+    dw.add_argument("--subnet", required=True)
+    dw.add_argument("--host-ip", required=False)
 
-    if ns1 not in cfg["namespaces"]:
-        print(f"⚠️ Namespace {ns1} does not  exist in config.")
-        return
-    if ns2 not in cfg["namespaces"]:
-        print(f"⚠️ Namespace {ns2} does not  exist in config.")
-        return
-    ns1_network_ip = cfg["namespaces"][ns1]["network_cidr"]
-    ns2_network_ip = cfg["namespaces"][ns2]["network_cidr"]
-    bridge_cidr = cfg["networks"][bridge]["cidr"]
+    # tests
+    t = sub.add_parser("test")
+    t.add_argument("--vpc", required=True)
 
-    run(f"ip netns exec {ns1} ip route add {ns2_network_ip} via {bridge_cidr.split('/')[0]}")
-    run(f"ip netns exec {ns2} ip route add {ns1_network_ip} via {bridge_cidr.split('/')[0]}")
+    return p
 
-    print(f"✅ Route updated for {ns1} and {ns2}.")
-
-
-def enable_nat(namespace, ext_if=None):
-    if ext_if:
-        print(f"🌐 Using specified external interface: {ext_if}")
-    else:
-        # ------------DETECT EXTERNAL INTERFACE-------------
-        route_output = subprocess.run(
-            ["ip", "route", "show", "default"],
-            capture_output=True,
-            text=True
-            ).stdout
-
-        match = re.search(r'dev (\w+)', route_output)
-        ext_if = match.group(1) if match else None
-
-        # ext_if = run(f"ip route show default | grep -oP 'dev \K\w+'").stdout.decode().strip()
-        if not ext_if:
-            print("External Interface could not be detected. Please specify it manually.")
-            return
-        print(f"🌐 Detected external interface: {ext_if}")
-
-
-
-    cfg = load_config()
-    if namespace not in cfg["namespaces"]:
-        print(f"⚠️ Namespace {namespace} does not  exist in config.")
-        return
-    ns_cidr = cfg["namespaces"][namespace]["ns_ip"]
-    bridge = cfg["namespaces"][namespace]["bridge"]
-    bridge_cidr = cfg["networks"][bridge]["cidr"]
-
-    if not ns_cidr or not bridge_cidr:
-        print(f"❌ Namespace {namespace} or Bridge {bridge} does not have an IP assigned.")
-        return
-
-    run("sysctl -w net.ipv4.ip_forward=1")
-    run("iptables -t nat -F POSTROUTING")
-    run(f"iptables -t nat -A POSTROUTING -s {ns_cidr} -o {ext_if} -j MASQUERADE")
-    run(f"iptables -A FORWARD -i {bridge} -o {ext_if} -s {ns_cidr} -j ACCEPT")
-    run(f"iptables -A FORWARD -i {ext_if} -o {bridge} -d {ns_cidr} -m state --state ESTABLISHED,RELATED -j ACCEPT")
-
-    cfg["namespaces"][namespace]["public"] = True
-    save_config(cfg)
-    print(f"✅ NAT enabled for {namespace} with IP {ns_cidr} via {ext_if}.")
-
-# ---------- DELETE COMMANDS ----------
-def delete_bridge(name):
-    run(f"ip link set {name} down || true")
-    run(f"ip link delete {name} type bridge || true")
-    print(f"✅ Bridge {name} deleted.")
-
-def delete_namespace(name):
-    run(f"ip netns del {name} || true")
-    print(f"✅ Namespace {name} deleted.")
-
-def delete_veth(name):
-    run(f"ip link del {name} || true")
-    print(f"✅ Veth {name} deleted.")
-
-# ---------- STATUS ----------
-def status():
-    print("\n=== Bridges ===")
-    run("ip link show type bridge || true")
-    print("\n=== Namespaces ===")
-    run("ip netns list")
-    print("\n=== IPs and Routes ===")
-    run("ip addr")
-    run("ip route")
-
-def show_config():
-    cfg = load_config()
-    print(json.dumps(cfg, indent=4))
-
-# ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser(description="vPCCTL - Modular VPC CLI")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # CREATE
-    parser_create = subparsers.add_parser("create", help="Create resources")
-    parser_create.add_argument("type", choices=["bridge", "namespace", "veth"])
-    parser_create.add_argument("name", help="Resource name")
-    parser_create.add_argument("--ip", help="IP address for bridge or namespace (with CIDR)")
-    parser_create.add_argument("--veth-host", help="Host-side veth name (for namespace auto veth creation)")
-    parser_create.add_argument("--bridge", help="Bridge name (for namespace auto veth creation)")
-
-    # SET
-    parser_set = subparsers.add_parser("set", help="Set IP, route, NAT")
-    parser_set.add_argument("type", choices=["ip", "route", "nat"])
-    parser_set.add_argument("args", nargs="*")
-
-    # DELETE
-    parser_delete = subparsers.add_parser("delete", help="Delete resources")
-    parser_delete.add_argument("type", choices=["bridge", "namespace", "veth"])
-    parser_delete.add_argument("name")
-
-    # STATUS
-    subparsers.add_parser("status", help="Show vPC status")
-
-     # CONFIG
-    subparsers.add_parser("config", help="Show vPC configuration")
-
-    args = parser.parse_args()
-
-    if args.command == "create":
-        if args.type == "bridge":
-            create_bridge(args.name, args.ip)
-        elif args.type == "namespace":
-            create_namespace(args.name, ip=args.ip, bridge=args.bridge)
-        elif args.type == "veth":
-            print("Usage: vpcctl create veth <veth_ns> <veth_host> <namespace> <bridge>")
-            # Example: vpcctl create veth v-sub-1 v-sub-1_br sub_1 v-net-1
-
-    elif args.command == "set":
-        if args.type == "ip":
-            set_ip(*args.args)
-        elif args.type == "route":
-            set_route(*args.args)
-        elif args.type == "nat":
-            enable_nat(*args.args)
-
-    elif args.command == "delete":
-        if args.type == "bridge":
-            delete_bridge(args.name)
-        elif args.type == "namespace":
-            delete_namespace(args.name)
-        elif args.type == "veth":
-            delete_veth(args.name)
-
-    elif args.command == "status":
-        status()
-    
-    elif args.command == "config":
-        show_config()
-    else:
-        parser.print_help()
+    if os.geteuid() != 0:
+        print("This tool must be run as root. Use sudo.")
         sys.exit(1)
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.cmd:
+        parser.print_help(); sys.exit(0)
+    if args.cmd == "create-vpc":
+        create_vpc(args)
+    elif args.cmd == "add-subnet":
+        add_subnet(args)
+    elif args.cmd == "delete-vpc":
+        delete_vpc(args)
+    elif args.cmd == "list-vpcs":
+        list_vpcs(args)
+    elif args.cmd == "apply-policy":
+        apply_policy(args)
+    elif args.cmd == "peer":
+        peer_vpcs(args)
+    elif args.cmd == "deploy-web":
+        deploy_web(args)
+    elif args.cmd == "test":
+        tests(args)
+    else:
+        print("Unknown command:", args.cmd)
 
 if __name__ == "__main__":
     main()
