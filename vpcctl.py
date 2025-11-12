@@ -50,10 +50,12 @@ def ns_name(vpc, subnet):
     return f"{vpc}-{subnet}"
 
 def veth_host_name(vpc, subnet):
-    return f"veth-{vpc}-{subnet}-h"
+    name = f"v-{vpc[:3]}-{subnet[:3]}-h"
+    return name[:15]  # ensure max length 15
 
 def veth_ns_name(vpc, subnet):
-    return f"veth-{vpc}-{subnet}-ns"
+    name = f"v-{vpc[:3]}-{subnet[:3]}-n"
+    return name[:15]  # ensure max length 15
 
 def gw_ip(gateway):
     return gateway  # provided
